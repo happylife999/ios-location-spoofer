@@ -874,25 +874,92 @@
     return "";
   }
 
-  function readScriptArguments() {
-    if (typeof $argument === "undefined" || $argument == null) {
-      return {};
+  function isPlaceholderValue(value) {
+    return typeof value === "string" && /^\{[^}]+\}$/.test(value.trim());
+  }
+
+  function readPluginStoreArg(name) {
+    if (typeof $persistentStore === "undefined" || !$persistentStore.read) {
+      return null;
     }
-    if (typeof $argument === "string") {
-      return parseArgumentString($argument);
+    try {
+      var value = $persistentStore.read(name);
+      if (value == null || value === "") {
+        return null;
+      }
+      return String(value);
+    } catch (err) {
+      return null;
     }
-    if (typeof $argument === "object") {
-      var out = {};
-      var key;
-      for (key in $argument) {
-        if (Object.prototype.hasOwnProperty.call($argument, key)) {
-          var value = $argument[key];
-          out[key] = value == null ? "" : String(value);
+  }
+
+  function enrichArgsFromPluginStore(args) {
+    var keys = [
+      "enabled",
+      "latitude",
+      "longitude",
+      "altitude",
+      "address",
+      "configHost",
+      "configToken",
+      "configUrl",
+      "debug"
+    ];
+    var i;
+    args = args || {};
+    for (i = 0; i < keys.length; i += 1) {
+      var key = keys[i];
+      var current = args[key];
+      if (current == null || current === "" || isPlaceholderValue(current)) {
+        var stored = readPluginStoreArg(key);
+        if (stored != null && !isPlaceholderValue(stored)) {
+          args[key] = stored;
         }
       }
-      return out;
     }
-    return parseArgumentString(String($argument));
+    return args;
+  }
+
+  function readScriptArguments() {
+    var out = {};
+    if (typeof $argument !== "undefined" && $argument != null) {
+      if (typeof $argument === "string") {
+        out = parseArgumentString($argument);
+      } else if (typeof $argument === "object") {
+        var key;
+        for (key in $argument) {
+          if (Object.prototype.hasOwnProperty.call($argument, key)) {
+            var value = $argument[key];
+            out[key] = value == null ? "" : String(value);
+          }
+        }
+      } else {
+        out = parseArgumentString(String($argument));
+      }
+    }
+    return enrichArgsFromPluginStore(out);
+  }
+
+  function logScriptArguments(debug) {
+    if (!debug) {
+      return;
+    }
+    var args = readScriptArguments();
+    var raw =
+      typeof $argument === "undefined" || $argument == null
+        ? "<none>"
+        : typeof $argument === "object"
+          ? JSON.stringify($argument)
+          : String($argument);
+    console.log("Location spoofer $argument raw: " + raw);
+    console.log(
+      "Location spoofer args parsed: lat=" +
+        args.latitude +
+        ", lng=" +
+        args.longitude +
+        ", configUrl=" +
+        (resolveConfigUrl(args) || "<none>")
+    );
   }
 
   function detectRuntime() {
@@ -1244,19 +1311,17 @@
         callback(normalizeConfig(cfg));
       } catch (err) {
         if (debug) {
-          console.log("Location spoofer config invalid: " + err.message);
+          console.log("Location spoofer config invalid: " + err.message + " | cfg lat/lng=" + cfg.latitude + "," + cfg.longitude);
         }
-        callback(
-          normalizeConfig(
-            mergeConfig(DEFAULT_CONFIG, {
-              enabled: cfg.enabled,
-              failOpen: true,
-              debug: debug
-            })
-          )
-        );
+        if (!Number.isFinite(Number(cfg.latitude)) || !Number.isFinite(Number(cfg.longitude))) {
+          cfg.latitude = DEFAULT_CONFIG.latitude;
+          cfg.longitude = DEFAULT_CONFIG.longitude;
+        }
+        callback(normalizeConfig(cfg));
       }
     }
+
+    logScriptArguments(debug);
 
     if (!configUrl) {
       finish();
@@ -1695,6 +1760,9 @@
       headers["X-Location-Spoofer-Wifi-Count"] = String(info.wifiCount);
       headers["X-Location-Spoofer-Cell-Count"] = String(info.cellCount || 0);
     }
+    if (info && info.targetLat != null && info.targetLng != null) {
+      headers["X-Location-Spoofer-Target"] = String(info.targetLat) + "," + String(info.targetLng);
+    }
     if (isLoonRuntime()) {
       $done({
         status: ($response && $response.status) || 200,
@@ -1752,7 +1820,9 @@
     doneRewriteResponse(responseResult.response, {
       wifiCount: responseResult.wifiCount,
       cellCount: responseResult.cellCount,
-      debug: config.debug
+      debug: config.debug,
+      targetLat: config.latitude,
+      targetLng: config.longitude
     });
   }
 
@@ -1761,15 +1831,20 @@
   }
 
   function runShadowrocket() {
-    var hasRequest = typeof $request !== "undefined";
-    var hasResponse = typeof $response !== "undefined";
-    var args = readScriptArguments();
-    var mode = String(args.mode || "response").toLowerCase();
+    var hasRequest = typeof $request !== "undefined" && $request != null;
+    var hasResponse = typeof $response !== "undefined" && $response != null;
 
     if (!hasRequest && !hasResponse) {
-      if (mode === "cron" || mode === "geocode") {
-        runGeocodeCron();
+      runMaintenanceCron();
+      return;
+    }
+
+    if (hasRequest && !hasResponse) {
+      var prepArgs = readScriptArguments();
+      if (parseBoolean(prepArgs.debug, false)) {
+        console.log("Location spoofer prepare -> Accept-Encoding: identity");
       }
+      donePreparedRequestPassThrough();
       return;
     }
 
@@ -1777,11 +1852,6 @@
       try {
         if (!config.enabled) {
           donePassThrough();
-          return;
-        }
-
-        if (!hasResponse && config.mode === "prepare") {
-          donePreparedRequestPassThrough();
           return;
         }
 
