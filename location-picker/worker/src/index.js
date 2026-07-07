@@ -4,7 +4,7 @@
  * API（与 location-picker/server.js 兼容）：
  *   GET  /loc.json?token=   → 读取坐标 JSON（Loon / Shadowrocket configUrl）
  *   POST /set?token=        → 保存坐标
- *   GET  /?token=           → 地图选点网页
+ *   GET  /?token=           → 地图选点网页（必须带正确 token）
  */
 
 import { PAGE } from "./page.js";
@@ -12,6 +12,7 @@ import { PAGE } from "./page.js";
 const KV_KEY = "loc";
 
 const DEFAULT = {
+  enabled: true,          // false = 脚本放行原始响应（恢复真实定位）
   latitude: 37.3349,
   longitude: -122.00902,
   altitude: 530,
@@ -51,6 +52,21 @@ function unauthorized() {
   return jsonResponse({ error: "bad token" }, 403);
 }
 
+// 常量时间比较，避免通过响应时延逐字节爆破 token
+function safeEqual(a, b) {
+  const enc = new TextEncoder();
+  const ab = enc.encode(String(a));
+  const bb = enc.encode(String(b));
+  if (ab.length !== bb.length) {
+    return false;
+  }
+  let diff = 0;
+  for (let i = 0; i < ab.length; i += 1) {
+    diff |= ab[i] ^ bb[i];
+  }
+  return diff === 0;
+}
+
 function checkToken(request, env) {
   const configured = env.TOKEN;
   if (!configured) {
@@ -58,7 +74,7 @@ function checkToken(request, env) {
   }
   const url = new URL(request.url);
   const token = url.searchParams.get("token");
-  if (token !== configured) {
+  if (token == null || !safeEqual(token, configured)) {
     return { ok: false, error: "bad token" };
   }
   return { ok: true };
@@ -125,6 +141,7 @@ export default {
         }
         const lo = wrapLng(loRaw);
         const cur = await readLoc(env);
+        cur.enabled = true; // 保存一个新位置 = 开启伪造
         cur.latitude = la;
         cur.longitude = lo;
         setInt(cur, "altitude", j.altitude);
@@ -137,8 +154,31 @@ export default {
       }
     }
 
+    // ---- 一键切换：伪造 / 恢复真实定位 ----
+    if (url.pathname === "/enable" && request.method === "POST") {
+      if (!auth.ok) {
+        return unauthorized();
+      }
+      let bodyText;
+      try {
+        bodyText = await request.text();
+        if (bodyText.length > 10000) {
+          return jsonResponse({ error: "payload too large" }, 413);
+        }
+        const j = JSON.parse(bodyText);
+        const cur = await readLoc(env);
+        cur.enabled = j.enabled !== false; // false=恢复真实定位（脚本放行）
+        await writeLoc(env, cur);
+        return jsonResponse(cur);
+      } catch (error) {
+        return jsonResponse({ error: "bad json" }, 400);
+      }
+    }
+
     if ((url.pathname === "/" || url.pathname === "") && request.method === "GET") {
-      // 地图页允许无 token 打开，但保存/读取 API 仍需 token
+      if (!auth.ok) {
+        return unauthorized();
+      }
       return textResponse(PAGE, "text/html; charset=utf-8");
     }
 
